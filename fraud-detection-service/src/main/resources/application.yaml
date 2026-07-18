@@ -1,3 +1,12 @@
 spring:
   application:
     name: fraud-detection-service
+
+account:
+  service:
+    url: ${ACCOUNT_SERVICE_URL:http://localhost:6001}
+
+fraud:
+  max-transactions-minute: 5
+  suspicious-amount-multiplier: 5.0
+  max-balance-percentage: 0.90
