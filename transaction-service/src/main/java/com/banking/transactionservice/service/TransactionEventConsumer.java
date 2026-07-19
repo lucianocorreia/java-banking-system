@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
@@ -27,6 +28,7 @@ public class TransactionEventConsumer {
     private static final long OTP_EXPIRATION_MINUTES = 5;
     private static final String TRANSACTION_OTP_GENERATED_TOPIC = "transaction.otp.generated";
 
+    @KafkaListener(topics = "verification.required")
     public void consumeVerificationRequired(
         @Payload
         Map<String, Object> payload) {
@@ -52,7 +54,8 @@ public class TransactionEventConsumer {
             log.info("Generated OTP for transaction {}: {}", transactionId, otp);
 
             // Store OTP in Redis with 5 min expiration
-            redisTemplate.opsForValue().set("otp:" + transactionId, otp,
+            String otpKey = "verification:otp:" + transactionId;
+            redisTemplate.opsForValue().set(otpKey, otp,
                 Duration.ofMinutes(OTP_EXPIRATION_MINUTES));
 
             // Update Status

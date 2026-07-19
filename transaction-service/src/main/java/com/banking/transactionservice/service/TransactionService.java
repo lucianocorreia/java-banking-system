@@ -1,8 +1,9 @@
 package com.banking.transactionservice.service;
 
-import java.util.List;
-import java.util.UUID;
+import java.time.LocalDateTime;
+import java.util.*;
 
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -10,6 +11,7 @@ import com.banking.transactionservice.client.AccountServiceClient;
 import com.banking.transactionservice.dto.TransactionResponse;
 import com.banking.transactionservice.dto.TransferRequest;
 import com.banking.transactionservice.entity.*;
+import com.banking.transactionservice.event.TransactionCompletedEvent;
 import com.banking.transactionservice.event.TransactionInitiatedEvent;
 import com.banking.transactionservice.repository.TransactionRepository;
 
@@ -23,12 +25,12 @@ public class TransactionService {
     private final TransactionRepository transactionRepository;
     private final AccountServiceClient accountServiceClient;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final RedisTemplate<String, String> redisTemplate;
 
     private static final String TRANSACTION_INITIATED_TOPIC = "transaction.initiated";
-    // private static final String TRANSACTION_COMPLETED_TOPIC =
-    // "transaction.completed";
-    // private static final String TRANSACTION_REFUNDED_TOPIC =
-    // "transaction.refunded";
+    private static final String TRANSACTION_COMPLETED_TOPIC = "transaction.completed";
+    private static final String TRANSACTION_REFUNDED_TOPIC = "transaction.refunded";
+    private static final String FRAUD_DETECTED_TOPIC = "fraud.detected";
 
     public TransactionResponse transfer(TransferRequest request) {
         log.info("Start transfer - {} -> {} amount {}", request.getSenderAccountNumber(),
@@ -77,7 +79,87 @@ public class TransactionService {
     }
 
     public TransactionResponse verifyOTP(String transactionId, String otp) {
-        throw new UnsupportedOperationException("Unimplemented method 'verifyOTP'");
+        log.info("OTP verification for the transaction: {}", transactionId);
+
+        Transaction transaction = transactionRepository.findById(transactionId)
+            .orElseThrow(() -> new RuntimeException("Transaction not found: " + transactionId));
+
+        String otpKey = "verification:otp:" + transactionId;
+        String storedOtp = redisTemplate.opsForValue().get(otpKey);
+
+        if (storedOtp == null) {
+            // OTP Expired
+            log.warn("Otp expired for transaction: {}", transactionId);
+            compensateTransaction(transaction,
+                "OTP expired, transaction cancelled and amount refunded");
+            return mapToResponse(transaction);
+        }
+
+        if (!storedOtp.equals(otp)) {
+            // OTP Mismatch
+            log.warn("Otp mismatch for transaction: {}", transactionId);
+            redisTemplate.delete(otpKey);
+            blockAccountAndCompensate(transaction,
+                "OTP mismatch, transaction cancelled and amount refunded");
+            return mapToResponse(transaction);
+        }
+
+        // OTP Correct
+        log.info("OTP verified - completing transaction: {}", transactionId);
+        redisTemplate.delete(otpKey);
+        completeTransaction(transaction);
+
+        return mapToResponse(transaction);
+    }
+
+    private void completeTransaction(Transaction transaction) {
+        transaction.setTransactionStatus(TransactionStatus.COMPLETED);
+        transaction.setCompletedAt(LocalDateTime.now());
+        transactionRepository.save(transaction);
+
+        TransactionCompletedEvent completedEvent = new TransactionCompletedEvent();
+        completedEvent.setTransactionId(transaction.getId());
+        completedEvent.setSenderAccountNumber(transaction.getSenderAccountNumber());
+        completedEvent.setReceiverAccountNumber(transaction.getReceiverAccountNumber());
+        completedEvent.setAmount(transaction.getAmount());
+        completedEvent.setDescription(transaction.getDescription());
+
+        kafkaTemplate.send(TRANSACTION_COMPLETED_TOPIC, transaction.getId(), completedEvent);
+        log.info("TransactionCompletedEvent published for transaction: {}", transaction.getId());
+    }
+
+    private void blockAccountAndCompensate(Transaction transaction, String reason) {
+        // Publish fraud.detected
+        Map<String, Object> fraudEvent = new HashMap<>();
+        fraudEvent.put("transactionId", transaction.getId());
+        fraudEvent.put("accountNumber", transaction.getSenderAccountNumber());
+        fraudEvent.put("reason", reason);
+
+        kafkaTemplate.send(FRAUD_DETECTED_TOPIC, transaction.getSenderAccountNumber(), fraudEvent);
+        log.warn("FraudDetectedEvent published for transaction: {}", transaction.getId());
+
+        compensateTransaction(transaction, reason);
+    }
+
+    private void compensateTransaction(Transaction transaction, String reason) {
+        log.info("Compensating transaction: {} - {}", transaction.getId(), reason);
+
+        // Credite money back
+        accountServiceClient.creditBalance(transaction.getSenderAccountNumber(),
+            transaction.getAmount());
+        transaction.setTransactionStatus(TransactionStatus.FLAGGED);
+        transaction.setFailureReason(reason);
+        transactionRepository.save(transaction);
+
+        // Publish Notification Event
+        Map<String, Object> refundEvent = new HashMap<>();
+        refundEvent.put("transactionId", transaction.getId());
+        refundEvent.put("senderAccountNumber", transaction.getSenderAccountNumber());
+        refundEvent.put("amount", transaction.getAmount());
+        refundEvent.put("reason", reason);
+
+        kafkaTemplate.send(TRANSACTION_REFUNDED_TOPIC, transaction.getId(), refundEvent);
+        log.info("TransactionRefundedEvent published for transaction: {}", transaction.getId());
     }
 
     private TransactionResponse mapToResponse(Transaction savedTransaction) {
